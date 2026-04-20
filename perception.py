@@ -1,6 +1,7 @@
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
 import yaml
 import cv2
 import mediapipe as mp
@@ -23,13 +24,13 @@ BGR_COLORS = {
     'blue': (255, 0, 0),
 }
 
-
 # Load the global configuration from cfg.yml
 CFG_PATH = BASE_DIR / 'cfg.yml'
 with open(CFG_PATH, 'r', encoding='utf-8') as f:
     cfg = yaml.safe_load(f)
 
 mediapipe_cfg = cfg["mediapipe"]
+
 
 @dataclass
 class GestureColorMapping:
@@ -41,7 +42,6 @@ class GestureColorMapping:
 
 def invert_mapping(mapping: GestureColorMapping):
     # Convert color -> gesture mapping into gesture -> color mapping
-    # so detected gestures can be translated directly into cube colors
     return {
         mapping.red: 'red',
         mapping.green: 'green',
@@ -50,7 +50,6 @@ def invert_mapping(mapping: GestureColorMapping):
 
 
 def create_gesture_recognizer(model_path: Path):
-    # Build the MediaPipe gesture recognizer with fixed options
     BaseOptions = mp.tasks.BaseOptions
     GestureRecognizer = mp.tasks.vision.GestureRecognizer
     GestureRecognizerOptions = mp.tasks.vision.GestureRecognizerOptions
@@ -69,31 +68,33 @@ def create_gesture_recognizer(model_path: Path):
 
 class GesturePerception:
     def __init__(self, mapping: GestureColorMapping, model_path: Path = MODEL_PATH, stable_frames: int = 8):
-        # Check that the model exists before creating the recognizer
         if not model_path.exists():
             raise FileNotFoundError(
                 f'Model file not found: {model_path}\n'
                 'Download gesture_recognizer.task and place it next to perception.py.'
             )
 
-        # Save the user-selected gesture mapping
         self.mapping = mapping
         self.gesture_to_color = invert_mapping(mapping)
-
-        # Create MediaPipe recognizer
         self.recognizer = create_gesture_recognizer(model_path)
 
-        # Number of consecutive frames required before triggering a command
         self.stable_frames = stable_frames
-
-        # Internal debounce state
         self.last_color = None
         self.stable_count = 0
+
+        # Store latency of each frame in the current stable sequence
+        self.frame_latencies_ms = []
 
         # Start time used to generate monotonically increasing timestamps in ms
         self.start_time = time.time()
 
+    @staticmethod
+    def _time_ns():
+        return time.perf_counter_ns()
+
     def process_frame(self, frame):
+        frame_start_ns = self._time_ns()
+
         # Mirror the webcam image so interaction feels natural to the user
         frame = cv2.flip(frame, 1)
 
@@ -109,35 +110,40 @@ class GesturePerception:
         detected_color = None
         triggered_color = None
 
-        # Read the top gesture if at least one gesture prediction is available
         if result.gestures and len(result.gestures[0]) > 0:
             detected_gesture = result.gestures[0][0].category_name
 
-        # Convert the detected gesture into a mapped color
         if detected_gesture in self.gesture_to_color:
             detected_color = self.gesture_to_color[detected_gesture]
 
-            # Debounce: require the same mapped color for several consecutive frames
+            frame_end_ns = self._time_ns()
+            frame_latency_ms = (frame_end_ns - frame_start_ns) / 1_000_000.0
+
             if detected_color == self.last_color:
                 self.stable_count += 1
+                self.frame_latencies_ms.append(frame_latency_ms)
             else:
                 self.last_color = detected_color
                 self.stable_count = 1
+                self.frame_latencies_ms = [frame_latency_ms]
 
-            # Trigger the command only when the stability threshold is reached
             if self.stable_count == self.stable_frames:
                 triggered_color = detected_color
+
+                mean_latency_ms = (
+                    sum(self.frame_latencies_ms) / len(self.frame_latencies_ms)
+                    if self.frame_latencies_ms else 0.0
+                )
+                print(f'[Perception] Mean latency per frame: {mean_latency_ms:.6f} ms')
         else:
-            # Reset debounce state when no mapped gesture is detected
             self.last_color = None
             self.stable_count = 0
+            self.frame_latencies_ms = []
 
-        # Draw visualization on the frame for user feedback
         self._draw_overlay(frame, detected_gesture, detected_color)
         return frame, detected_gesture, detected_color, triggered_color
 
     def _draw_overlay(self, frame, detected_gesture, detected_color):
-        # Render the current recognition status on top of the image
         font = cv2.FONT_HERSHEY_SIMPLEX
         if detected_color is not None:
             color_bgr = BGR_COLORS[detected_color]
@@ -148,5 +154,4 @@ class GesturePerception:
             cv2.putText(frame, 'Perform a mapped gesture', (20, 40), font, 0.8, (200, 200, 200), 2, cv2.LINE_AA)
 
     def close(self):
-        # Release MediaPipe resources cleanly
         self.recognizer.close()

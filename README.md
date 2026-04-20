@@ -3,7 +3,7 @@ Real time perception framework for Human-Robot Interaction
 
 Create the environment with
 
-`conda create --file environment.yml`
+`conda env create -f environment.yml`
 
 To run the full pipeline:
 
